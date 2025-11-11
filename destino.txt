@@ -1,0 +1,11 @@
+module cl(output wire out, input wire a, b, input wire [1:0] S);
+
+  wire and1, or1, xor1, not1;
+
+  and andb(and1, a, b);
+  or aorb(or1, a, b);
+  xor axorb(xor1, a, b);
+  not nota(not1, a);
+  mux4_1 mux(out, and1, or1, xor1, not1, S);
+
+endmodule

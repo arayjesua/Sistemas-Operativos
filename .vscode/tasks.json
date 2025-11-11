@@ -1,0 +1,29 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "cppbuild",
+			"label": "C/C++: c_cpp_properties.json build active file",
+			"command": "/home/arayjesua/Ingenieria_Informatica/SSOO/.vscode/c_cpp_properties.json",
+			"args": [
+				"-fdiagnostics-color=always",
+				"-g",
+				"${file}",
+				"-o",
+				"${fileDirname}/${fileBasenameNoExtension}",
+				"-std=c++23"
+			],
+			"options": {
+				"cwd": "${fileDirname}"
+			},
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"detail": "compiler: /home/arayjesua/Ingenieria_Informatica/SSOO/.vscode/c_cpp_properties.json"
+		}
+	]
+}
