@@ -23,34 +23,126 @@ std::string get_environment_variable(const std::string& name) {
   }
 }
 
-bool check_file(const std::string& file) {
-  struct stat stat1;
-  if (stat(file.c_str(), &stat1) != 0) {
-    const char* error = "ERROR: No se pudieron cargar los datos de ARCHIVO.\n";
-    write(STDERR_FILENO, error, strlen(error));
-    return false;
+std::string get_work_dir() {
+  return std::string(get_environment_variable("BACKUP_WORK_DIR"));
+}
+
+std::string get_fifo_path() {
+  std::string dir_trabajo = get_work_dir();
+  std::string fifo_path = dir_trabajo + "/backup.fifo";
+  return fifo_path;
+}
+
+std::string get_pid_file_path() {
+  std::string dir_trabajo = get_work_dir();
+  std::string pid_path = dir_trabajo + "/backup-server.pid";
+  return pid_path;
+}
+
+std::expected<std::string, std::system_error> get_absolute_path(const std::string& path) {
+  char* absolute_path_buffer = realpath(path.c_str(), nullptr);
+  if (absolute_path_buffer == nullptr) {
+    free(absolute_path_buffer);
+    return std::unexpected(std::system_error(errno, std::system_category(), "Error al convertir la ruta en absoluta\n"));
   }
-  if (access(file.c_str(), F_OK) != 0) {
-    const char* error = "ERROR: El archivo no existe\n";
-    write(STDERR_FILENO, error, strlen(error));
-    return false;
-  }
-  if (!S_ISREG(stat1.st_mode)) {
-    const char* error = "ERROR: El archivo no es regular\n";
-    write(STDERR_FILENO, error, strlen(error));
+  std::string absolute_path = absolute_path_buffer;
+  free(absolute_path_buffer);
+  return absolute_path;
+}
+
+bool file_exists(const std::string& path) {
+  if (access(path.c_str(), F_OK) != 0) {
     return false;
   }
   return true;
 }
 
-int open_file(const std::string& archivo) {
-  int abierto = open(archivo.c_str(), O_RDONLY);
-  if (abierto == -1) {
-    const char* error = "ERROR: No se pudo abrir el archivo\n";
+bool is_regular_file(const std::string& path) {
+  struct stat stat1;
+  if (stat(path.c_str(), &stat1) != 0) {
+    const char* error = "Error al cargar los datos del archivo\n";
     write(STDERR_FILENO, error, strlen(error));
-    return abierto;
+    return false;
   }
-  return abierto;
+  if (!S_ISREG(stat1.st_mode)) {
+    return false;
+  }
+  return true;
+}
+
+bool is_directory(const std::string& path) {
+  struct stat es_dir;
+  if (stat(path.c_str(), &es_dir) == -1) {
+    return false;
+  } else {
+      if (!S_ISDIR(es_dir.st_mode)) {
+        return false;
+      }
+  }
+  return true;
+}
+
+std::string get_current_dir() {
+  char dir[1024];
+  char* current_dir = getcwd(dir, 1024);
+  if (current_dir == NULL) {
+    const char* error = "Error al obtener el directorio actual\n";
+    write(STDERR_FILENO, error, strlen(error));
+    return std::string();
+  }
+  return std::string(current_dir);
+}
+
+std::string get_filename(const std::string& path) {
+  char* path_copy = new char[path.length() + 1];
+  path.copy(path_copy, path.size());
+  std::string origen{basename(path_copy)};
+  delete[] path_copy;
+  return origen;
+}
+
+bool check_args(int argc, char* argv[]) {
+  if (argc != 2) {
+    return false;
+  }
+  if (is_directory(argv[1])) {
+    return false;
+  }
+  return true;
+}
+
+std::expected<void, std::system_error> check_work_dir_exists(const std::string& work_dir) {  
+  struct stat stat1;
+  if (stat(work_dir.c_str(), &stat1) != 0) {
+    return std::unexpected(std::system_error(errno, std::system_category(), "ERROR"));
+  }
+  if (!is_directory(work_dir)) {
+    return std::unexpected(std::system_error(errno, std::system_category(), "ERROR"));
+  }
+  if (access(work_dir.c_str(), W_OK) != 0) {
+    return std::unexpected(std::system_error(errno, std::system_category(), "ERROR"));
+  }
+  if (access(work_dir.c_str(), R_OK) != 0) {
+    return std::unexpected(std::system_error(errno, std::system_category(), "ERROR"));
+  }
+  return {};
+}
+
+std::expected<int, std::system_error> open_fifo_write(const std::string& fifo_path) {
+  int abrir_fifo = open(fifo_path.c_str(), O_WRONLY);
+  if (abrir_fifo == -1) {
+    return std::unexpected(std::system_error(errno, std::system_category(), "Error al abrir la FIFO para escritura\n"));
+  }
+  return abrir_fifo;
+}
+
+std::expected<void, std::system_error> write_path_to_fifo(int fifo_fd, const std::string& file_path) {
+  std::string path = file_path + '\n';
+  int escrito = write(fifo_fd, path.data(), path.size());
+  if (escrito == -1) {
+    return std::unexpected(std::system_error(errno, std::system_category(), "Error al escribir en la FIFO\n"));
+  }
+  return {}; 
 }
 
 bool existe_proceso(const pid_t& pid) {
@@ -61,14 +153,6 @@ bool existe_proceso(const pid_t& pid) {
     }
   }
   return true;
-}
-
-std::string get_absolute_path(const std::string& path) {
-  char absolute_path[buffer_size];
-  if (realpath(path.c_str(), absolute_path) == NULL) {
-    return std::string();
-  }
-  return std::string(absolute_path);
 }
 
 int mandar_señal(const pid_t& pid) {
@@ -82,26 +166,32 @@ int mandar_señal(const pid_t& pid) {
 }
 
 int main(int argc, char* argv[]) {
-  std::string var_env = get_environment_variable("BACKUP_WORK_DIR");
-  if (var_env.empty()) {
-    const char* no_existe = "ERROR: La variable de entorno BACKUP_WORK_DIR no está definida.\n";
-    write(STDERR_FILENO, no_existe, strlen(no_existe));
+  // std::string var_env = get_environment_variable("BACKUP_WORK_DIR");
+  // if (var_env.empty()) {
+  //   const char* no_existe = "ERROR: La variable de entorno BACKUP_WORK_DIR no está definida.\n";
+  //   write(STDERR_FILENO, no_existe, strlen(no_existe));
+  //   return EXIT_FAILURE;
+  // }
+  std::string var_env = get_work_dir();
+  auto error_work_dir = check_work_dir_exists(var_env);
+  if (!error_work_dir.has_value()) {
+    std::system_error error = error_work_dir.error();
+    std::string message = error.what();
+    write(STDERR_FILENO, message.c_str(), message.length());
     return EXIT_FAILURE;
   }
   std::string file{};
-  if (argc != 2) {
-    const char* error = "ERROR: No se ha pasado ningún archivo para ser copiado\n";
-    write(STDERR_FILENO, error, strlen(error));
-    return EXIT_FAILURE;
+  if (check_args(argc, argv)) {
+    file = argv[1];
   } else {
-      file = argv[1];
+      return EXIT_FAILURE;
   }
-  if (!check_file(file)) {
+  if ((!file_exists(file)) && (!is_regular_file(file))) {
     return EXIT_FAILURE;
   }
-  std::string archivo_pid = var_env + "/backup-server.pid";
+  std::string archivo_pid = get_pid_file_path();
   pid_t pid;
-  int abierto = open_file(archivo_pid);
+  int abierto = open(archivo_pid.c_str(), O_RDONLY);
   int tamaño;
   if (abierto != -1) {
     std::string pid_obtenido(buffer_size, '\0');
@@ -112,30 +202,36 @@ int main(int argc, char* argv[]) {
       return EXIT_FAILURE;
     }
     pid_obtenido.resize(tamaño);
-    pid = std::atoi(pid_obtenido.c_str());
+    pid = std::stoi(pid_obtenido);
   }
   if (!existe_proceso(pid)) {
     const char* error = "ERROR: El proceso ya existe\n";
     write(STDERR_FILENO, error, strlen(error));
     return EXIT_FAILURE;
   }
-  std::string fifo = var_env + "/backup.fifo";
+  std::string fifo = get_fifo_path();
   int abrir_fifo = open(fifo.c_str(), O_WRONLY);
   if (abrir_fifo == -1) {
     const char* error = "ERROR: No se pudo abrir el archivo FIFO\n";
     write(STDERR_FILENO, error, strlen(error));
     return EXIT_FAILURE;
   }
-  std::string absolute_path = get_absolute_path(file) + "\n";
-  if (absolute_path.empty()) {
-    const char* error = "ERROR: No se pudo convertir a dirección absoluta\n";
-    write(STDERR_FILENO, error, strlen(error));
-    return EXIT_FAILURE;
+  auto camino = get_absolute_path(file);
+  std::string absolute_path;
+  if (camino) {
+    absolute_path = *camino + '\n';
+  } else {
+      std::system_error error = camino.error();
+      std::string message = error.what();
+      write(STDERR_FILENO, message.c_str(), message.length());
+      return EXIT_FAILURE;
   }
-  int escribir_fifo = write(abrir_fifo, absolute_path.c_str(), absolute_path.length());
-  if (escribir_fifo == -1) {
-    const char* error = "ERROR: No se pudo escribir en el archivo FIFO\n";
-    write(STDERR_FILENO, error, strlen(error));
+
+  auto error_write = write_path_to_fifo(abrir_fifo, absolute_path);
+  if (!error_write.has_value()) {
+    std::system_error error = error_write.error();
+    std::string message = error.what();
+    write(STDERR_FILENO, message.c_str(), message.length());
     return EXIT_FAILURE;
   }
   if (mandar_señal(pid) == -1) {

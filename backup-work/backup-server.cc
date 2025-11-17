@@ -16,11 +16,6 @@
 const int buffer_size = 65536;
 std::atomic<bool> quit_requested{false};
 sigset_t conjunto_señales;
-struct sigaction sa = {
-  sa.sa_handler = signal_handler,
-  sa.sa_mask = {},
-  sa.sa_flags = 0
-};
 
 std::string get_environment_variable(const std::string& name) {
   char* value = getenv(name.c_str());
@@ -32,12 +27,12 @@ std::string get_environment_variable(const std::string& name) {
 }
 
 std::string get_work_dir() {
-  return std::string(get_environment_variable("BAKCUP_WORK_DIR"));
+  return std::string(get_environment_variable("BACKUP_WORK_DIR"));
 }
 
 std::string get_fifo_path() {
   std::string dir_trabajo = get_work_dir();
-  std::string fifo_path = dir_trabajo + "/bakcup.fifo";
+  std::string fifo_path = dir_trabajo + "/backup.fifo";
   return fifo_path;
 }
 
@@ -158,7 +153,7 @@ std::expected<void, std::system_error> create_fifo(const std::string& fifo_path)
       write(STDERR_FILENO, error, strlen(error));
       int tuberia_recreada = unlink(fifo_path.c_str());
       if (tuberia_recreada == -1) {
-        std::unexpected(std::system_error(errno, std::system_category(), "No se pudo crear la FIFO"));
+        return std::unexpected(std::system_error(errno, std::system_category(), "No se pudo crear la FIFO"));
       } else {
           return create_fifo(fifo_path);
       }
@@ -172,6 +167,7 @@ std::expected<void, std::system_error> create_fifo(const std::string& fifo_path)
         return std::unexpected(std::system_error(errno, std::system_category(), "Error en la creación del FIFO"));
     }
   }
+  return {};
 }
 
 std::expected<void, std::system_error> write_pid_file(const std::string& pid_file_path) {
@@ -187,10 +183,19 @@ std::expected<void, std::system_error> write_pid_file(const std::string& pid_fil
     return std::unexpected(std::system_error(errno, std::system_category(), "Error al escribir en el achivo PID\n"));
   }
   close(pid_file_open);
+  return {};
+}
+
+void signal_handler(int signum) {
+  quit_requested = true;
+  kill(getpid(), SIGUSR1);
 }
 
 std::expected<void, std::system_error> setup_signal_handler() {
-  int señal = sigemptyset(&conjunto_señales);
+  struct sigaction sa = {};
+  sa.sa_handler = signal_handler;
+  int señal = sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
   if (señal == -1) {
     return std::unexpected(std::system_error(errno, std::system_category(), "No es una señal válida\n"));
   }
@@ -214,12 +219,7 @@ std::expected<void, std::system_error> setup_signal_handler() {
   if (sigaction(SIGQUIT, &sa, NULL) == -1) {
     return std::unexpected(std::system_error(errno, std::system_category(), "Error al configurar el manejador\n"));
   }
-}
-
-void signal_handler(int signum) {
-  char* message = "señal de terminación recibida, cerrando...\n";
-  write(STDOUT_FILENO, message, strlen(message));
-  quit_requested = true;
+  return {};
 }
 
 std::expected<std::string, std::system_error> read_path_from_fifo(int fifo_fd) {
@@ -229,6 +229,11 @@ std::expected<std::string, std::system_error> read_path_from_fifo(int fifo_fd) {
   for (int i{0}; i < PATH_MAX; ++i) {
     int leido = read(fifo_fd, &ultimo_caracter_leido, 1);
     if (leido == -1) {
+      if (errno == EINTR) {
+        if (quit_requested) {
+          return std::unexpected(std::system_error(ECANCELED, std::system_category(), "Llamada de finalización"));
+        }
+      }
       return std::unexpected(std::system_error(errno, std::system_category(), "Error al leer la ruta de la FIFO\n"));
     } else if (leido == 0) {
         break;
@@ -240,72 +245,6 @@ std::expected<std::string, std::system_error> read_path_from_fifo(int fifo_fd) {
     }
   }
   return std::unexpected(std::system_error(errno, std::system_category(), "Tamaño máximo excedido"));
-}
-
-void run_server(int fifo_fd, const std::string& backup_dir) {
-  setup_signal_handler();
-  int sig;
-  while (!quit_requested) {
-    int espera = sigwait(&conjunto_señales, &sig);
-    if (espera != 0) {
-      const char* error = "Error al bloquear las señales\n";
-      write(STDERR_FILENO, error, strlen(error));
-      break;
-    }
-    if (sig == SIGUSR1) {
-      auto ruta_origen = read_path_from_fifo(fifo_fd);
-      std::string path;
-      if (ruta_origen) {
-        path = *ruta_origen;
-      } else {
-          std::system_error error = ruta_origen.error();
-          std::string mensaje = error.what();
-          write(STDERR_FILENO, mensaje.c_str(), mensaje.length());
-      }
-      if (path.empty()) {
-        close(fifo_fd);
-        fifo_fd = open(get_fifo_path().c_str(), O_RDONLY);
-        continue;
-      }
-      std::string archivo = get_filename(path);
-      std::string destino_backup = backup_dir + "/" + archivo;
-      auto copia = copy_file(path, destino_backup, 0666);
-      if (copia.has_value()) {
-        const char* exito = "ARCHIVO COPIADO CON ÉXITO\n";
-        write (STDOUT_FILENO, exito, std::strlen(exito));
-      } else {
-          std::system_error error = copia.error();
-          std::string msg_error{error.what()};
-          msg_error += "\n";
-          write(STDERR_FILENO, msg_error.c_str(), msg_error.length());
-          continue;
-      }
-    }
-  }
-}
-
-int open_file(const std::string& file) {
-  int abierto = open(file.c_str(), O_RDONLY);
-  if (abierto == -1) {
-    const char* error = "Error al abrir el archivo: ";
-    if (errno == ENOENT) {
-      const char* no_existe = "El archivo no existe\n";
-      write(STDERR_FILENO, no_existe, strlen(no_existe));
-    } else if (errno == EACCES) {
-        const char* permisos = "Faltan permisos\n";
-        write(STDERR_FILENO, permisos, strlen(permisos));
-    } else if (errno == EISDIR) {
-        const char* directorio = "No es un archivo. Es un directorio\n";
-        write(STDERR_FILENO, directorio, strlen(directorio));
-    } else {
-        const char* error = "Error no reconocido\n";
-        write(STDERR_FILENO, error, strlen(error));
-    }
-  } else {
-      const char* abierto = "El archivo fue abierto con éxito\n";
-      write(STDOUT_FILENO, abierto, strlen(abierto));
-  }
-  return abierto;
 }
 
 bool directorio_correcto(const char* direccion) {
@@ -328,52 +267,6 @@ bool directorio_correcto(const char* direccion) {
   return true;
 }
 
-int manejo_señales(sigset_t& conjunto) {
-  int señal = sigemptyset(&conjunto);
-  if (señal == -1) {
-    const char* error = "ERROR: No es una señal válida\n";
-    write(STDERR_FILENO, error, strlen(error));
-    return señal;
-  }
-  señal = sigaddset(&conjunto, SIGUSR1);
-  if (señal == -1) {
-    const char* error = "Error al añadir SIGUSR1 al set\n";
-    write(STDERR_FILENO, error, strlen(error));
-    return señal;
-  }
-  señal = sigaddset(&conjunto, SIGINT);
-  if (señal == -1) {
-    const char* error = "Error al añadir SIGINT al set\n";
-    write(STDERR_FILENO, error, strlen(error));
-    return señal;
-  }
-  señal = sigaddset(&conjunto, SIGTERM);
-  if (señal == -1) {
-    const char* error = "Error al añadir SIGTERM al set\n";
-    write(STDERR_FILENO, error, strlen(error));
-    return señal;
-  }
-  señal = sigaddset(&conjunto, SIGQUIT);
-  if (señal == -1) {
-    const char* error = "Error al añadir SIGQUIT al set\n";
-    write(STDERR_FILENO, error, strlen(error));
-    return señal;
-  }
-  señal = sigaddset(&conjunto, SIGHUP);
-  if (señal == -1) {
-    const char* error = "Error al añadir SIGHUP al set\n";
-    write(STDERR_FILENO, error, strlen(error));
-    return señal;
-  }
-  señal = sigprocmask(SIG_BLOCK, &conjunto, NULL);
-  if (señal == -1) {
-    const char* error = "Error al bloquear las señales\n";
-    write(STDERR_FILENO, error, strlen(error));
-    return señal;
-  }
-  return señal;
-}
-
 std::expected<void, std::system_error> copy_file(const std::string& src_path, const std::string& dest_path, mode_t dst_perms=0) {
   int origen = open(src_path.c_str(), O_RDONLY);
   if (origen == -1) {
@@ -393,72 +286,62 @@ std::expected<void, std::system_error> copy_file(const std::string& src_path, co
   return {};
 }
 
-// *********************** REVISAR MAIN ************************ //
-
-int main(int argc, char* argv[]) {
-  std::string var_env = get_environment_variable("BACKUP_WORK_DIR");
-  if (var_env.empty()) {
-    const char* no_existe = "La variable de entorno BACKUP_WORK_DIR no está definida.\n";
-    write(STDERR_FILENO, no_existe, strlen(no_existe));
-    return EXIT_FAILURE;
-  }
-  const char* directorio{};
-  if (argc == 1) {
-    directorio = ".";
-  } else {
-      directorio = argv[1];
-  }
-  if (!directorio_correcto(directorio)) {
-    return EXIT_FAILURE;
-  }
-  std::string ruta_pid = var_env + "/backup-server.pid";
-  std::string pid;
-  int archivo_pid = open_file(ruta_pid.c_str());
-  if (archivo_pid != -1) {
-    std::string buffer_pid(buffer_size, '\0');
-    int tamaño = read(archivo_pid, buffer_pid.data(), buffer_size);
-    buffer_pid.resize(tamaño);
-    pid = buffer_pid;
-    close(archivo_pid);
-  }
-  if (!pid.empty()) {
-    if (proceso_existe(pid)) {
-      const char* existe = "El proceso ya existe.\n";
-      write(STDERR_FILENO, existe, strlen(existe));
-      return EXIT_FAILURE;
-    } else {
-        const char* no_existe = "El proceso no existe.\n";
-        write(STDOUT_FILENO, no_existe, strlen(no_existe));
+void run_server(int fifo_fd, const std::string& backup_dir) {
+  int sig;
+  while (!quit_requested) {
+    int espera = sigwait(&conjunto_señales, &sig);
+    if (espera != 0) {
+      if (espera == EINTR) {
+        continue;
+      }
+      const char* error = "Error al bloquear las señales\n";
+      write(STDERR_FILENO, error, strlen(error));
+      break;
+    }
+    if (sig == SIGUSR1) {
+      auto ruta_origen = read_path_from_fifo(fifo_fd);
+      std::string path;
+      if (ruta_origen) {
+        path = *ruta_origen;
+      } else {
+          std::system_error error = ruta_origen.error();
+          if (error.code() == std::errc::operation_canceled) {
+            continue;
+          }
+          std::string mensaje = error.what() + '\n';
+          write(STDERR_FILENO, mensaje.c_str(), mensaje.length());
+      }
+      if (path.empty()) {
+        close(fifo_fd);
+        fifo_fd = open(get_fifo_path().c_str(), O_RDONLY);
+        if (fifo_fd == -1) {
+          if (errno == EINTR) {
+            if (quit_requested) {
+              break;
+            }
+          }
+        }
+        continue;
+      }
+      std::string archivo = get_filename(path);
+      std::string destino_backup = backup_dir + "/" + archivo;
+      auto copia = copy_file(path, destino_backup, 0666);
+      if (copia.has_value()) {
+        const char* exito = "ARCHIVO COPIADO CON ÉXITO\n";
+        write (STDOUT_FILENO, exito, std::strlen(exito));
+      } else {
+          std::system_error error = copia.error();
+          std::string msg_error{error.what()};
+          msg_error += "\n";
+          write(STDERR_FILENO, msg_error.c_str(), msg_error.length());
+          continue;
+      }
     }
   }
-  std::string fifo{var_env + "/backup.fifo"};
-  if (crear_fifo(fifo) != -1) {
-    ruta_pid = var_env + "/backup-server.pid";
-    int archivo_pid = open(ruta_pid.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (archivo_pid != -1) {
-      pid_t pid_pros = getpid();
-      std::string pid_process;
-      pid_process += std::to_string(pid_pros) + "\n";
-      write(archivo_pid, pid_process.data(), pid_process.length());
-      close(archivo_pid);
-    } else {
-        return EXIT_FAILURE;
-    }
-  }
-  sigset_t conjunto;
-  if (manejo_señales(conjunto) == -1) {
-    return EXIT_FAILURE;
-  }
-  int fifo_abierto = open(fifo.c_str(), O_RDONLY);
-  if (fifo_abierto == -1) {
-    const char* error = "Error al abrir el FIFO\n";
-    write(STDERR_FILENO, error, strlen(error));
-    return EXIT_FAILURE;
-  }
-  // BUCLE PRINCIPAL
-
-  close(fifo_abierto);
-  std::string pid_path = var_env +"/backup-server.pid";
+  const char* message = "señal de terminación recibida, cerrando...\n";
+  write(STDOUT_FILENO, message, strlen(message));
+  close(fifo_fd);
+  std::string pid_path = get_pid_file_path();
   if (unlink(pid_path.c_str()) != -1) {
     const char* exito = "ARCHIVO PID BORRADO CON ÉXITO\n";
     write (STDOUT_FILENO, exito, std::strlen(exito));
@@ -466,13 +349,107 @@ int main(int argc, char* argv[]) {
       const char* exito = "Error al borrar el archivo PID\n";
       write (STDERR_FILENO, exito, std::strlen(exito));
   }
-
-  if (unlink(fifo.c_str()) != -1) {
+  std::string fifo_path = get_fifo_path();
+  if (unlink(fifo_path.c_str()) != -1) {
     const char* exito = "ARCHIVO FIFO BORRADO CON ÉXITO\n";
     write (STDOUT_FILENO, exito, std::strlen(exito));
   } else {
       const char* exito = "Error al borrar el archivo FIFO\n";
       write (STDERR_FILENO, exito, std::strlen(exito));
   }
+}
+
+int main(int argc, char* argv[]) {
+  std::string var_env = get_work_dir();
+  if (var_env.empty()) {
+    const char* no_existe = "La variable de entorno BACKUP_WORK_DIR no está definida.\n";
+    write(STDERR_FILENO, no_existe, strlen(no_existe));
+    return EXIT_FAILURE;
+  }
+  const char* directorio{};
+  if (argc == 1) {
+    directorio = get_current_dir().c_str();
+  } else {
+      directorio = argv[1];
+  }
+  if (!directorio_correcto(directorio)) {
+    return EXIT_FAILURE;
+  }
+  std::string ruta_pid = get_pid_file_path();
+  std::string pid;
+  int archivo_pid = open(ruta_pid.c_str(), O_RDONLY);
+  if (archivo_pid != -1) {
+    if (errno = EINTR) {
+      if (quit_requested) {
+        std::string abortar = "Llamada de terminación\n";
+        write(STDERR_FILENO, abortar.c_str(), abortar.length());
+        return EXIT_FAILURE;
+      }
+    }
+    std::string buffer_pid(buffer_size, '\0');
+    int tamaño = read(archivo_pid, buffer_pid.data(), buffer_size);
+    buffer_pid.resize(tamaño);
+    pid = buffer_pid;
+    close(archivo_pid);
+  } else {
+      std::string error{"Error al abrir el archivo.\n"};
+      write(STDERR_FILENO, error.c_str(), error.length());
+  }
+  if (!pid.empty()) {
+    pid_t pid_server = std::stoi(pid);
+    if (is_server_running(pid_server)) {
+      const char* existe = "El proceso ya existe.\n";
+      write(STDERR_FILENO, existe, strlen(existe));
+      return EXIT_FAILURE;
+    } else {
+        const char* no_existe = "El proceso no existe. Creando...\n";
+        write(STDOUT_FILENO, no_existe, strlen(no_existe));
+    }
+  }
+  std::string fifo = get_fifo_path();
+  auto error = create_fifo(fifo);
+  if (!error.has_value()) {
+      std::system_error error_message = error.error();
+      std::string message = error_message.what();
+      write(STDERR_FILENO, message.c_str(), message.length());
+      return EXIT_FAILURE;
+  }
+
+  auto error_signal = setup_signal_handler();
+  if (!error_signal.has_value()) {
+    std::system_error error = error_signal.error();
+    std::string message = error.what();
+    write(STDERR_FILENO, message.c_str(), message.length());
+    return EXIT_FAILURE;
+  }
+
+  auto error_pid = write_pid_file(ruta_pid);
+  if (!error_pid.has_value()) {
+    std::system_error error = error_pid.error();
+    std::string message = error.what();
+    write(STDERR_FILENO, message.c_str(), message.length());
+    unlink(ruta_pid.c_str());
+    unlink(fifo.c_str());
+    return EXIT_FAILURE;
+  }
+
+  int fifo_abierto = open(fifo.c_str(), O_RDONLY);
+  if (fifo_abierto == -1) {
+    if (errno == EINTR) {
+      if (quit_requested) {
+        std::string abortar = "Llamada de terminación\n";
+        write(STDERR_FILENO, abortar.c_str(), abortar.length());
+        unlink(ruta_pid.c_str());
+        unlink(fifo.c_str());
+        return EXIT_FAILURE;
+      }
+    }
+    const char* error = "Error al abrir el FIFO\n";
+    write(STDERR_FILENO, error, strlen(error));
+    unlink(ruta_pid.c_str());
+    unlink(fifo.c_str());
+    return EXIT_FAILURE;
+  }
+  run_server(fifo_abierto, directorio);
   return EXIT_SUCCESS;
 }

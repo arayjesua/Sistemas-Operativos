@@ -9,7 +9,7 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/backup-server",
-            "args": ["~/Ingenieria_Informatica"],
+            "args": ["~/Ingenieria_Informatica/SSOO/backup-work/prueba"],
             "stopAtEntry": false,
             "cwd": "${fileDirname}",
             "environment": [],
