@@ -166,12 +166,6 @@ int mandar_señal(const pid_t& pid) {
 }
 
 int main(int argc, char* argv[]) {
-  // std::string var_env = get_environment_variable("BACKUP_WORK_DIR");
-  // if (var_env.empty()) {
-  //   const char* no_existe = "ERROR: La variable de entorno BACKUP_WORK_DIR no está definida.\n";
-  //   write(STDERR_FILENO, no_existe, strlen(no_existe));
-  //   return EXIT_FAILURE;
-  // }
   std::string var_env = get_work_dir();
   auto error_work_dir = check_work_dir_exists(var_env);
   if (!error_work_dir.has_value()) {
@@ -184,9 +178,13 @@ int main(int argc, char* argv[]) {
   if (check_args(argc, argv)) {
     file = argv[1];
   } else {
+      std::string error = "No se ha pasado un archivo como argumento\n";
+      write(STDERR_FILENO, error.c_str(), error.length());
       return EXIT_FAILURE;
   }
   if ((!file_exists(file)) && (!is_regular_file(file))) {
+    std::string error = "El archivo no es regular\n";
+    write(STDERR_FILENO, error.c_str(), error.length());
     return EXIT_FAILURE;
   }
   std::string archivo_pid = get_pid_file_path();

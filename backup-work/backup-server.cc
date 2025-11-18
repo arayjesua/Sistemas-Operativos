@@ -187,8 +187,9 @@ std::expected<void, std::system_error> write_pid_file(const std::string& pid_fil
 }
 
 void signal_handler(int signum) {
+  char message[] = "Señal de terminación recibida, cerrando...\n";
+  write(STDOUT_FILENO, message, sizeof(message) - 1);
   quit_requested = true;
-  kill(getpid(), SIGUSR1);
 }
 
 std::expected<void, std::system_error> setup_signal_handler() {
@@ -230,9 +231,7 @@ std::expected<std::string, std::system_error> read_path_from_fifo(int fifo_fd) {
     int leido = read(fifo_fd, &ultimo_caracter_leido, 1);
     if (leido == -1) {
       if (errno == EINTR) {
-        if (quit_requested) {
-          return std::unexpected(std::system_error(ECANCELED, std::system_category(), "Llamada de finalización"));
-        }
+        return std::unexpected(std::system_error(ECANCELED, std::system_category(), "Llamada de finalización"));
       }
       return std::unexpected(std::system_error(errno, std::system_category(), "Error al leer la ruta de la FIFO\n"));
     } else if (leido == 0) {
@@ -278,8 +277,11 @@ std::expected<void, std::system_error> copy_file(const std::string& src_path, co
   }
   int tamaño;
   std::vector<char> buffer(buffer_size);
-  while ((tamaño = read(origen, buffer.data(), buffer_size)) > 0) {
+  while ((tamaño = read(origen, buffer.data(), buffer_size)) > 0 && errno != EINTR && !quit_requested) {
     write(destino, buffer.data(), tamaño);
+  }
+  if (errno == EINTR && quit_requested) {
+    return std::unexpected(std::system_error(ECANCELED, std::system_category(), "Copia cancelada por terminación"));
   }
   close(origen);
   close(destino);
@@ -287,18 +289,13 @@ std::expected<void, std::system_error> copy_file(const std::string& src_path, co
 }
 
 void run_server(int fifo_fd, const std::string& backup_dir) {
-  int sig;
+  siginfo_t sig;
   while (!quit_requested) {
-    int espera = sigwait(&conjunto_señales, &sig);
-    if (espera != 0) {
-      if (espera == EINTR) {
-        continue;
-      }
-      const char* error = "Error al bloquear las señales\n";
-      write(STDERR_FILENO, error, strlen(error));
+    int espera = sigwaitinfo(&conjunto_señales, &sig);
+    if (espera == -1) {
       break;
     }
-    if (sig == SIGUSR1) {
+    if (sig.si_signo == SIGUSR1) {
       auto ruta_origen = read_path_from_fifo(fifo_fd);
       std::string path;
       if (ruta_origen) {
@@ -310,15 +307,14 @@ void run_server(int fifo_fd, const std::string& backup_dir) {
           }
           std::string mensaje = error.what() + '\n';
           write(STDERR_FILENO, mensaje.c_str(), mensaje.length());
+          break;
       }
       if (path.empty()) {
         close(fifo_fd);
         fifo_fd = open(get_fifo_path().c_str(), O_RDONLY);
         if (fifo_fd == -1) {
-          if (errno == EINTR) {
-            if (quit_requested) {
-              break;
-            }
+          if (quit_requested) {
+            break;
           }
         }
         continue;
@@ -338,8 +334,6 @@ void run_server(int fifo_fd, const std::string& backup_dir) {
       }
     }
   }
-  const char* message = "señal de terminación recibida, cerrando...\n";
-  write(STDOUT_FILENO, message, strlen(message));
   close(fifo_fd);
   std::string pid_path = get_pid_file_path();
   if (unlink(pid_path.c_str()) != -1) {
@@ -366,6 +360,9 @@ int main(int argc, char* argv[]) {
     write(STDERR_FILENO, no_existe, strlen(no_existe));
     return EXIT_FAILURE;
   }
+  if (!directorio_correcto(var_env.c_str())) {
+    return EXIT_FAILURE;
+  }
   const char* directorio{};
   if (argc == 1) {
     directorio = get_current_dir().c_str();
@@ -379,7 +376,7 @@ int main(int argc, char* argv[]) {
   std::string pid;
   int archivo_pid = open(ruta_pid.c_str(), O_RDONLY);
   if (archivo_pid != -1) {
-    if (errno = EINTR) {
+    if (errno == EINTR) {
       if (quit_requested) {
         std::string abortar = "Llamada de terminación\n";
         write(STDERR_FILENO, abortar.c_str(), abortar.length());
@@ -414,7 +411,6 @@ int main(int argc, char* argv[]) {
       write(STDERR_FILENO, message.c_str(), message.length());
       return EXIT_FAILURE;
   }
-
   auto error_signal = setup_signal_handler();
   if (!error_signal.has_value()) {
     std::system_error error = error_signal.error();
@@ -432,7 +428,6 @@ int main(int argc, char* argv[]) {
     unlink(fifo.c_str());
     return EXIT_FAILURE;
   }
-
   int fifo_abierto = open(fifo.c_str(), O_RDONLY);
   if (fifo_abierto == -1) {
     if (errno == EINTR) {
