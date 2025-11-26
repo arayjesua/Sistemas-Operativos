@@ -9,7 +9,7 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/backup-server",
-            "args": ["-x", "../prueba"],
+            "args": ["-x"],
             "stopAtEntry": false,
             "cwd": "${fileDirname}",
             "environment": [],
